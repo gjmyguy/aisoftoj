@@ -439,6 +439,16 @@ export type KnowledgePointRecommendation = {
   level: 'low' | 'medium' | 'high' | 'must';
   reason: string;
   suggestion: string;
+  sourceType?: 'document_knowledge_graph' | 'category_fallback' | string;
+  knowledgeBaseId?: number | null;
+  sources?: Array<{
+    documentId: string;
+    documentName: string;
+    sourcePageRange?: string;
+    headingPath: string[];
+    confidence?: number;
+    evidence?: string;
+  }>;
   prerequisiteNames: string[];
   relatedNames: string[];
   evidences: WrongQuestionEvidence[];
@@ -473,17 +483,24 @@ export type KnowledgeGraph = {
   source: string;
 };
 
-export async function fetchKnowledgePointRecommendations(signal?: AbortSignal): Promise<KnowledgePointRecommendation[]> {
-  return request<KnowledgePointRecommendation[]>('/recommendations/knowledge-points', { signal });
+export async function fetchKnowledgePointRecommendations(
+  knowledgeBaseId?: number,
+  signal?: AbortSignal
+): Promise<KnowledgePointRecommendation[]> {
+  const query = knowledgeBaseId ? `?knowledgeBaseId=${knowledgeBaseId}` : '';
+  return request<KnowledgePointRecommendation[]>(`/recommendations/knowledge-points${query}`, { signal });
 }
 
 export type KnowledgeGraphScope = 'focus' | 'full';
 
 export async function fetchKnowledgeGraph(
   scope: KnowledgeGraphScope = 'focus',
+  knowledgeBaseId?: number,
   signal?: AbortSignal
 ): Promise<KnowledgeGraph> {
-  return request<KnowledgeGraph>(`/recommendations/knowledge-graph?scope=${scope}`, { signal });
+  const params = new URLSearchParams({ scope });
+  if (knowledgeBaseId) params.set('knowledgeBaseId', String(knowledgeBaseId));
+  return request<KnowledgeGraph>(`/recommendations/knowledge-graph?${params.toString()}`, { signal });
 }
 
 export async function updateKnowledgeGraphNode(

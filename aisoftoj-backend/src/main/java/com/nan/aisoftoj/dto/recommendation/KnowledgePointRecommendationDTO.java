@@ -18,7 +18,10 @@ public class KnowledgePointRecommendationDTO {
     private String level;
     private String reason;
     private String suggestion;
+    private String sourceType;
+    private Long knowledgeBaseId;
     private List<String> prerequisiteNames = new ArrayList<>();
     private List<String> relatedNames = new ArrayList<>();
+    private List<KnowledgePointSourceDTO> sources = new ArrayList<>();
     private List<WrongQuestionEvidenceDTO> evidences = new ArrayList<>();
 }

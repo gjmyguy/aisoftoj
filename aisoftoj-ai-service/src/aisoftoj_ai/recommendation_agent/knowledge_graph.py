@@ -67,8 +67,12 @@ async def build_knowledge_graph_relations(
     return _sanitize_graph(parsed, weak_points, max_nodes, max_edges)
 
 
-async def _retrieve_contexts(search, weak_points: list[dict[str, Any]], knowledge_base_ids: list[str]) -> list[dict[str, Any]]:
-    if not knowledge_base_ids:
+async def _retrieve_contexts(
+    search,
+    weak_points: list[dict[str, Any]],
+    knowledge_base_ids: list[str],
+) -> list[dict[str, Any]]:
+    if search is None or not knowledge_base_ids:
         return []
 
     contexts: list[dict[str, Any]] = []

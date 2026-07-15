@@ -15,10 +15,16 @@ from aisoftoj_ai.services import get_services
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """创建并关闭 FastAPI 生命周期内复用的 Redis 连接池。"""
-    app.state.redis = await create_pool(RedisSettings.from_dsn(get_settings().redis_url))
-    await get_services().store.ensure_collection()
-    yield
-    await app.state.redis.close()
+    settings = get_settings()
+    app.state.redis = None
+    if not settings.qwen_only_mode:
+        app.state.redis = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+        await get_services().store.ensure_collection()
+    try:
+        yield
+    finally:
+        if app.state.redis is not None:
+            await app.state.redis.close()
 
 
 app = FastAPI(title="知构 AI 服务", version="0.1.0", lifespan=lifespan)
@@ -47,4 +53,17 @@ async def require_internal_secret(request, call_next):
 @app.get("/health")
 async def health() -> dict:
     """健康检查接口。"""
-    return {"status": "ok", "message": "服务运行正常"}
+    qwen_only = get_settings().qwen_only_mode
+    return {
+        "status": "ok",
+        "mode": "qwen_only" if qwen_only else "full",
+        "message": "Qwen 图谱服务运行正常" if qwen_only else "服务运行正常",
+        "dependencies": {
+            "qwen": True,
+            "embedding": not qwen_only,
+            "reranker": not qwen_only,
+            "mineru": not qwen_only,
+            "qdrant": not qwen_only,
+            "redis": not qwen_only,
+        },
+    }

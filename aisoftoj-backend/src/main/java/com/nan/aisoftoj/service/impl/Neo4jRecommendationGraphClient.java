@@ -58,6 +58,7 @@ public class Neo4jRecommendationGraphClient {
                 for (WrongQuestionEvidenceDTO evidence : evidences) {
                     syncEvidence(tx, userId, evidence);
                 }
+                recalculateWeakRelations(tx, userId);
                 clearUserGeneratedRelations(tx, userId);
                 syncAgentGraph(tx, agentGraph);
                 syncKnowledgeRelations(tx, userId);
@@ -79,12 +80,40 @@ public class Neo4jRecommendationGraphClient {
                 for (WrongQuestionEvidenceDTO evidence : evidences) {
                     syncEvidence(tx, userId, evidence);
                 }
+                recalculateWeakRelations(tx, userId);
+                return null;
+            });
+        }
+    }
+
+    public void replaceWrongQuestionEvidence(Integer userId, List<WrongQuestionEvidenceDTO> evidences) {
+        if (!properties.isSyncEnabled()) {
+            return;
+        }
+        try (Session session = driver.session(sessionConfig())) {
+            session.writeTransaction(tx -> {
+                ensureConstraints(tx);
+                return null;
+            });
+            session.writeTransaction(tx -> {
+                tx.run("MERGE (:User {id: $userId})",
+                        Values.parameters("userId", String.valueOf(userId)));
+                tx.run("MATCH (:User {id: $userId})-[r:WRONG_ON|WEAK_AT]->() DELETE r",
+                        Values.parameters("userId", String.valueOf(userId)));
+                for (WrongQuestionEvidenceDTO evidence : evidences) {
+                    syncEvidence(tx, userId, evidence);
+                }
+                recalculateWeakRelations(tx, userId);
                 return null;
             });
         }
     }
 
     public KnowledgeGraphDTO loadUserWeakGraph(Integer userId) {
+        return loadUserWeakGraph(userId, null);
+    }
+
+    public KnowledgeGraphDTO loadUserWeakGraph(Integer userId, String knowledgeBaseId) {
         KnowledgeGraphDTO graph = new KnowledgeGraphDTO();
         graph.setGraphAvailable(true);
         graph.setSource("neo4j");
@@ -92,10 +121,15 @@ public class Neo4jRecommendationGraphClient {
         try (Session session = driver.session(sessionConfig())) {
             session.readTransaction(tx -> {
                 List<Record> weakRecords = tx.run(
-                        "MATCH (u:User {id: $userId})-[w:WEAK_AT]->(kp:KnowledgePoint) " +
-                                "RETURN kp, w " +
+                        "MATCH (u:User {id: $userId})-[:OWNS_DOCUMENT]->(d:KnowledgeDocument) " +
+                                "WHERE $knowledgeBaseId = '' OR d.knowledgeBaseId = $knowledgeBaseId " +
+                                "MATCH (d)-[:HAS_CHUNK]->(:Chunk)-[:MENTIONS]->(kp:KnowledgePoint) " +
+                                "MATCH (u)-[w:WEAK_AT]->(kp) " +
+                                "RETURN DISTINCT kp, w " +
                                 "ORDER BY w.score DESC LIMIT 18",
-                        Values.parameters("userId", String.valueOf(userId))
+                        Values.parameters(
+                                "userId", String.valueOf(userId),
+                                "knowledgeBaseId", firstNonBlank(knowledgeBaseId, ""))
                 ).list();
                 for (Record record : weakRecords) {
                     Value kp = record.get("kp");
@@ -110,6 +144,49 @@ public class Neo4jRecommendationGraphClient {
                     }
                 }
 
+                List<Record> relationRecords = tx.run(
+                        "MATCH (u:User {id: $userId})-[:OWNS_DOCUMENT]->(d:KnowledgeDocument) " +
+                                "WHERE $knowledgeBaseId = '' OR d.knowledgeBaseId = $knowledgeBaseId " +
+                                "MATCH (source:KnowledgePoint)-[r:PREREQUISITE_OF|RELATED_TO|CONTAINS|CONFUSED_WITH]->(target:KnowledgePoint) " +
+                                "WHERE r.documentId = d.id " +
+                                "  AND (source.id IN $knowledgeIds OR target.id IN $knowledgeIds) " +
+                                "RETURN DISTINCT source, target, source.id AS sourceId, target.id AS targetId, " +
+                                "       type(r) AS relType, coalesce(r.weight, 0.6) AS weight, " +
+                                "       coalesce(r.id, source.id + '-' + type(r) + '-' + target.id) AS edgeId, " +
+                                "       coalesce(r.label, '') AS label, coalesce(r.evidence, '') AS evidence, " +
+                                "       coalesce(r.source, '') AS sourceType, coalesce(r.reason, '') AS reason " +
+                                "ORDER BY weight DESC LIMIT 180",
+                        Values.parameters(
+                                "userId", String.valueOf(userId),
+                                "knowledgeBaseId", firstNonBlank(knowledgeBaseId, ""),
+                                "knowledgeIds", knowledgeIds)
+                ).list();
+                for (Record record : relationRecords) {
+                    addRelatedKnowledgeNode(nodes, record.get("source"));
+                    addRelatedKnowledgeNode(nodes, record.get("target"));
+                    String sourceId = record.get("sourceId").asString();
+                    String targetId = record.get("targetId").asString();
+                    String relType = record.get("relType").asString();
+                    String label = firstNonBlank(record.get("label").asString(), relationLabel(relType));
+                    addEdge(
+                            graph,
+                            record.get("edgeId").asString(),
+                            sourceId,
+                            targetId,
+                            relType,
+                            label,
+                            record.get("weight").asDouble(0.6),
+                            record.get("evidence").asString(),
+                            record.get("sourceType").asString(),
+                            record.get("reason").asString());
+                }
+
+                knowledgeIds.clear();
+                for (KnowledgeGraphDTO.NodeDTO node : nodes.values()) {
+                    if (!"question".equals(node.getType())) {
+                        knowledgeIds.add(node.getId());
+                    }
+                }
                 List<Record> questionRecords = tx.run(
                         "MATCH (u:User {id: $userId})-[:WRONG_ON]->(q:Question)-[t:TESTS|PENDING_TESTS]->(kp:KnowledgePoint) " +
                                 "WHERE kp.id IN $knowledgeIds " +
@@ -137,40 +214,6 @@ public class Neo4jRecommendationGraphClient {
                             "");
                 }
 
-                knowledgeIds.clear();
-                for (KnowledgeGraphDTO.NodeDTO node : nodes.values()) {
-                    if (!"question".equals(node.getType())) {
-                        knowledgeIds.add(node.getId());
-                    }
-                }
-                List<Record> relationRecords = tx.run(
-                        "MATCH (source:KnowledgePoint)-[r:PREREQUISITE_OF|RELATED_TO|CONTAINS|CONFUSED_WITH]->(target:KnowledgePoint) " +
-                                "WHERE source.id IN $knowledgeIds AND target.id IN $knowledgeIds " +
-                                "RETURN source.id AS sourceId, target.id AS targetId, type(r) AS relType, " +
-                                "       coalesce(r.weight, 0.6) AS weight, " +
-                                "       coalesce(r.id, source.id + '-' + type(r) + '-' + target.id) AS edgeId, " +
-                                "       coalesce(r.label, '') AS label, coalesce(r.evidence, '') AS evidence, " +
-                                "       coalesce(r.source, '') AS sourceType, coalesce(r.reason, '') AS reason " +
-                                "ORDER BY weight DESC LIMIT 180",
-                        Values.parameters("knowledgeIds", knowledgeIds)
-                ).list();
-                for (Record record : relationRecords) {
-                    String sourceId = record.get("sourceId").asString();
-                    String targetId = record.get("targetId").asString();
-                    String relType = record.get("relType").asString();
-                    String label = firstNonBlank(record.get("label").asString(), relationLabel(relType));
-                    addEdge(
-                            graph,
-                            record.get("edgeId").asString(),
-                            sourceId,
-                            targetId,
-                            relType,
-                            label,
-                            record.get("weight").asDouble(0.6),
-                            record.get("evidence").asString(),
-                            record.get("sourceType").asString(),
-                            record.get("reason").asString());
-                }
                 return null;
             });
         }
@@ -178,7 +221,218 @@ public class Neo4jRecommendationGraphClient {
         return graph;
     }
 
+    public List<Map<String, Object>> loadUserDocumentAlignments(
+            Integer userId,
+            String knowledgeBaseId) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        if (!properties.isSyncEnabled() || isBlank(knowledgeBaseId)) {
+            return result;
+        }
+        try (Session session = driver.session(sessionConfig())) {
+            session.readTransaction(tx -> {
+                List<Record> records = tx.run(
+                        "MATCH (u:User {id: $userId})-[:OWNS_DOCUMENT]->(d:KnowledgeDocument) " +
+                                "WHERE d.knowledgeBaseId = $knowledgeBaseId " +
+                                "MATCH (u)-[:WRONG_ON]->(q:Question)-[t:TESTS]->(kp:KnowledgePoint) " +
+                                "WHERE t.documentId = d.id AND t.source = 'llm_kg_alignment' " +
+                                "OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:Chunk)-[:MENTIONS]->(kp) " +
+                                "RETURN DISTINCT q.id AS questionId, kp.id AS knowledgePointId, " +
+                                "       coalesce(kp.canonicalName, kp.name) AS name, " +
+                                "       coalesce(kp.subject, '') AS subject, " +
+                                "       d.id AS documentId, coalesce(d.name, d.id) AS documentName, " +
+                                "       coalesce(c.sourcePageRange, '') AS sourcePageRange, " +
+                                "       coalesce(c.headingPath, []) AS headingPath, " +
+                                "       coalesce(t.confidence, 0.0) AS confidence, " +
+                                "       coalesce(t.reason, '') AS reason, coalesce(t.evidence, '') AS evidence " +
+                                "ORDER BY confidence DESC LIMIT 2000",
+                        Values.parameters(
+                                "userId", String.valueOf(userId),
+                                "knowledgeBaseId", knowledgeBaseId)
+                ).list();
+                for (Record record : records) {
+                    Map<String, Object> item = new HashMap<>();
+                    item.put("questionId", record.get("questionId").asString());
+                    item.put("knowledgePointId", record.get("knowledgePointId").asString());
+                    item.put("name", record.get("name").asString());
+                    item.put("subject", record.get("subject").asString());
+                    item.put("documentId", record.get("documentId").asString());
+                    item.put("documentName", record.get("documentName").asString());
+                    item.put("sourcePageRange", record.get("sourcePageRange").asString());
+                    item.put("headingPath", record.get("headingPath").asList(Value::asString));
+                    item.put("confidence", record.get("confidence").asDouble(0.0));
+                    item.put("reason", record.get("reason").asString());
+                    item.put("evidence", record.get("evidence").asString());
+                    result.add(item);
+                }
+                return null;
+            });
+        }
+        return result;
+    }
+
+    public List<Map<String, Object>> loadUserDocumentRelations(
+            Integer userId,
+            String knowledgeBaseId) {
+        List<Map<String, Object>> result = new ArrayList<>();
+        if (!properties.isSyncEnabled() || isBlank(knowledgeBaseId)) {
+            return result;
+        }
+        try (Session session = driver.session(sessionConfig())) {
+            session.readTransaction(tx -> {
+                List<Record> records = tx.run(
+                        "MATCH (u:User {id: $userId})-[:OWNS_DOCUMENT]->(d:KnowledgeDocument) " +
+                                "WHERE d.knowledgeBaseId = $knowledgeBaseId " +
+                                "MATCH (source:KnowledgePoint)-[r:PREREQUISITE_OF|RELATED_TO|CONTAINS|CONFUSED_WITH]->(target:KnowledgePoint) " +
+                                "WHERE r.documentId = d.id " +
+                                "RETURN DISTINCT source.id AS sourceId, " +
+                                "       coalesce(source.canonicalName, source.name) AS sourceName, " +
+                                "       target.id AS targetId, " +
+                                "       coalesce(target.canonicalName, target.name) AS targetName, " +
+                                "       type(r) AS relationType " +
+                                "LIMIT 4000",
+                        Values.parameters(
+                                "userId", String.valueOf(userId),
+                                "knowledgeBaseId", knowledgeBaseId)
+                ).list();
+                for (Record record : records) {
+                    Map<String, Object> item = new HashMap<>();
+                    item.put("sourceId", record.get("sourceId").asString());
+                    item.put("sourceName", record.get("sourceName").asString());
+                    item.put("targetId", record.get("targetId").asString());
+                    item.put("targetName", record.get("targetName").asString());
+                    item.put("relationType", record.get("relationType").asString());
+                    result.add(item);
+                }
+                return null;
+            });
+        }
+        return result;
+    }
+
+    public Map<String, Object> loadUserKnowledgeBaseAlignmentPayload(
+            Integer userId,
+            String knowledgeBaseId) {
+        Map<String, Object> payload = new HashMap<>();
+        List<Map<String, Object>> entities = new ArrayList<>();
+        List<Map<String, Object>> chunks = new ArrayList<>();
+        payload.put("entity_nodes", entities);
+        payload.put("kg_extraction_chunks", chunks);
+        if (!properties.isSyncEnabled() || isBlank(knowledgeBaseId)) {
+            return payload;
+        }
+        try (Session session = driver.session(sessionConfig())) {
+            session.readTransaction(tx -> {
+                List<Record> entityRecords = tx.run(
+                        "MATCH (u:User {id: $userId})-[:OWNS_DOCUMENT]->(d:KnowledgeDocument) " +
+                                "WHERE d.knowledgeBaseId = $knowledgeBaseId " +
+                                "MATCH (d)-[:HAS_CHUNK]->(c:Chunk)-[:MENTIONS]->(kp:KnowledgePoint) " +
+                                "RETURN kp, collect(DISTINCT c.id) AS sourceChunkIds " +
+                                "LIMIT 1000",
+                        Values.parameters(
+                                "userId", String.valueOf(userId),
+                                "knowledgeBaseId", knowledgeBaseId)
+                ).list();
+                for (Record record : entityRecords) {
+                    Value kp = record.get("kp");
+                    Map<String, Object> item = new HashMap<>();
+                    item.put("entity_id", kp.get("id").asString());
+                    item.put("name", valueString(kp, "name", ""));
+                    item.put("canonical_name", valueString(
+                            kp,
+                            "canonicalName",
+                            valueString(kp, "name", "")));
+                    item.put("aliases", valueStringList(kp, "aliases"));
+                    item.put("heading_path", valueStringList(kp, "headingPath"));
+                    item.put("disambiguation_key", valueString(kp, "disambiguationKey", ""));
+                    item.put("source_kg_chunk_ids", record.get("sourceChunkIds").asList(Value::asString));
+                    entities.add(item);
+                }
+
+                List<Record> chunkRecords = tx.run(
+                        "MATCH (u:User {id: $userId})-[:OWNS_DOCUMENT]->(d:KnowledgeDocument) " +
+                                "WHERE d.knowledgeBaseId = $knowledgeBaseId " +
+                                "MATCH (d)-[:HAS_CHUNK]->(c:Chunk) " +
+                                "RETURN DISTINCT c ORDER BY c.id LIMIT 1200",
+                        Values.parameters(
+                                "userId", String.valueOf(userId),
+                                "knowledgeBaseId", knowledgeBaseId)
+                ).list();
+                for (Record record : chunkRecords) {
+                    Value chunk = record.get("c");
+                    Map<String, Object> item = new HashMap<>();
+                    item.put("kg_chunk_id", chunk.get("id").asString());
+                    item.put("source_page_range", valueString(chunk, "sourcePageRange", ""));
+                    item.put("heading_path", valueStringList(chunk, "headingPath"));
+                    item.put("text", valueString(chunk, "text", ""));
+                    chunks.add(item);
+                }
+                return null;
+            });
+        }
+        return payload;
+    }
+
+    public void syncUserKnowledgeBaseAlignments(
+            Integer userId,
+            String knowledgeBaseId,
+            List<Map<String, Object>> alignments) {
+        if (!properties.isSyncEnabled() || isBlank(knowledgeBaseId)
+                || alignments == null || alignments.isEmpty()) {
+            return;
+        }
+        try (Session session = driver.session(sessionConfig())) {
+            session.writeTransaction(tx -> {
+                for (Map<String, Object> raw : alignments) {
+                    String questionId = firstNonBlank(
+                            string(raw.get("question_id")),
+                            string(raw.get("questionId")));
+                    String knowledgePointId = firstNonBlank(
+                            string(raw.get("knowledge_point_id")),
+                            string(raw.get("knowledgePointId")));
+                    double confidence = number(raw.get("confidence"), 0.0);
+                    if (isBlank(questionId) || isBlank(knowledgePointId) || confidence < 0.60) {
+                        continue;
+                    }
+                    Map<String, Object> params = new HashMap<>();
+                    params.put("userId", String.valueOf(userId));
+                    params.put("knowledgeBaseId", knowledgeBaseId);
+                    params.put("questionId", questionId);
+                    params.put("knowledgePointId", knowledgePointId);
+                    params.put("confidence", confidence);
+                    params.put("evidence", firstNonBlank(
+                            string(raw.get("evidence_text")),
+                            string(raw.get("evidence"))));
+                    params.put("reason", firstNonBlank(string(raw.get("reason")), ""));
+                    params.put("contextDependency", firstNonBlank(
+                            string(raw.get("context_dependency")),
+                            "chunk_context"));
+                    params.put("mappingMethod", firstNonBlank(
+                            string(raw.get("mapping_method")),
+                            "qwen_lexical_alignment"));
+                    tx.run("MATCH (u:User {id: $userId})-[wo:WRONG_ON]->(q:Question {id: $questionId}) " +
+                                    "MATCH (u)-[:OWNS_DOCUMENT]->(d:KnowledgeDocument) " +
+                                    "WHERE d.knowledgeBaseId = $knowledgeBaseId " +
+                                    "MATCH (kp:KnowledgePoint {id: $knowledgePointId}) " +
+                                    "WHERE kp.documentId = d.id " +
+                                    "MERGE (q)-[r:TESTS]->(kp) " +
+                                    "SET r.confidence = $confidence, r.weight = $confidence, " +
+                                    "    r.evidence = $evidence, r.reason = $reason, " +
+                                    "    r.contextDependency = $contextDependency, " +
+                                    "    r.mappingMethod = $mappingMethod, r.documentId = d.id, " +
+                                    "    r.source = 'llm_kg_alignment', r.updatedAt = datetime()",
+                            params);
+                }
+                recalculateWeakRelations(tx, userId);
+                return null;
+            });
+        }
+    }
+
     public KnowledgeGraphDTO loadUserFullGraph(Integer userId) {
+        return loadUserFullGraph(userId, null);
+    }
+
+    public KnowledgeGraphDTO loadUserFullGraph(Integer userId, String knowledgeBaseId) {
         KnowledgeGraphDTO graph = new KnowledgeGraphDTO();
         graph.setGraphAvailable(true);
         graph.setSource("neo4j_full");
@@ -186,13 +440,16 @@ public class Neo4jRecommendationGraphClient {
         try (Session session = driver.session(sessionConfig())) {
             session.readTransaction(tx -> {
                 List<Record> knowledgeRecords = tx.run(
-                        "MATCH (u:User {id: $userId})-[:OWNS_DOCUMENT]->(:KnowledgeDocument)-[:HAS_CHUNK]->(:Chunk)-[:MENTIONS]->(kp:KnowledgePoint) " +
+                        "MATCH (u:User {id: $userId})-[:OWNS_DOCUMENT]->(d:KnowledgeDocument)-[:HAS_CHUNK]->(:Chunk)-[:MENTIONS]->(kp:KnowledgePoint) " +
+                                "WHERE $knowledgeBaseId = '' OR d.knowledgeBaseId = $knowledgeBaseId " +
                                 "WITH DISTINCT u, kp " +
                                 "OPTIONAL MATCH (u)-[w:WEAK_AT]->(kp) " +
                                 "RETURN kp, w " +
                                 "ORDER BY CASE WHEN w IS NULL THEN 1 ELSE 0 END, coalesce(w.score, 0) DESC, kp.name " +
                                 "LIMIT 1200",
-                        Values.parameters("userId", String.valueOf(userId))
+                        Values.parameters(
+                                "userId", String.valueOf(userId),
+                                "knowledgeBaseId", firstNonBlank(knowledgeBaseId, ""))
                 ).list();
                 for (Record record : knowledgeRecords) {
                     Value weakRelation = record.get("w");
@@ -281,7 +538,9 @@ public class Neo4jRecommendationGraphClient {
             });
             session.writeTransaction(tx -> {
                 List<Record> records = tx.run(
-                        "MATCH (u:User {id: $userId})-[:WEAK_AT]->(weak:KnowledgePoint) " +
+                        "MATCH (u:User {id: $userId})-[:OWNS_DOCUMENT]->(:KnowledgeDocument)" +
+                                "-[:HAS_CHUNK]->(:Chunk)-[:MENTIONS]->(weak:KnowledgePoint) " +
+                                "MATCH (u)-[:WEAK_AT]->(weak) WITH DISTINCT u, weak " +
                                 "MATCH (kp:KnowledgePoint {id: $nodeId}) " +
                                 "WHERE weak = kp OR (weak)-[:PREREQUISITE_OF|RELATED_TO|CONTAINS|CONFUSED_WITH]-(kp) " +
                                 "SET kp.name = $label, kp.labelSource = 'manual', kp.source = coalesce(kp.source, 'manual'), " +
@@ -322,7 +581,9 @@ public class Neo4jRecommendationGraphClient {
             });
             session.writeTransaction(tx -> {
                 List<Record> records = tx.run(
-                        "MATCH (u:User {id: $userId})-[:WEAK_AT]->(weak:KnowledgePoint) " +
+                        "MATCH (u:User {id: $userId})-[:OWNS_DOCUMENT]->(:KnowledgeDocument)" +
+                                "-[:HAS_CHUNK]->(:Chunk)-[:MENTIONS]->(weak:KnowledgePoint) " +
+                                "MATCH (u)-[:WEAK_AT]->(weak) WITH DISTINCT u, weak " +
                                 "MATCH (a:KnowledgePoint)-[r:PREREQUISITE_OF|RELATED_TO|CONTAINS|CONFUSED_WITH]-(b:KnowledgePoint) " +
                                 "WHERE (weak = a OR weak = b) " +
                                 "  AND coalesce(r.id, startNode(r).id + '-' + type(r) + '-' + endNode(r).id) = $edgeId " +
@@ -377,7 +638,9 @@ public class Neo4jRecommendationGraphClient {
         try (Session session = driver.session(sessionConfig())) {
             session.writeTransaction(tx -> {
                 List<Record> records = tx.run(
-                        "MATCH (u:User {id: $userId})-[:WEAK_AT]->(weak:KnowledgePoint) " +
+                        "MATCH (u:User {id: $userId})-[:OWNS_DOCUMENT]->(:KnowledgeDocument)" +
+                                "-[:HAS_CHUNK]->(:Chunk)-[:MENTIONS]->(weak:KnowledgePoint) " +
+                                "MATCH (u)-[:WEAK_AT]->(weak) WITH DISTINCT u, weak " +
                                 "MATCH (a:KnowledgePoint)-[r:PREREQUISITE_OF|RELATED_TO|CONTAINS|CONFUSED_WITH]-(b:KnowledgePoint) " +
                                 "WHERE (weak = a OR weak = b) " +
                                 "  AND coalesce(r.id, startNode(r).id + '-' + type(r) + '-' + endNode(r).id) = $edgeId " +
@@ -397,6 +660,15 @@ public class Neo4jRecommendationGraphClient {
             Integer version,
             String status,
             String message) {
+        markDocumentGraphStatus(documentId, version, status, message, null);
+    }
+
+    public void markDocumentGraphStatus(
+            String documentId,
+            Integer version,
+            String status,
+            String message,
+            String runId) {
         if (!properties.isSyncEnabled() || isBlank(documentId)) {
             return;
         }
@@ -406,16 +678,57 @@ public class Neo4jRecommendationGraphClient {
                 return null;
             });
             session.writeTransaction(tx -> {
-                tx.run("MERGE (d:KnowledgeDocument {id: $documentId}) " +
-                                "SET d.version = $version, d.graphStatus = $status, " +
-                                "    d.graphErrorMessage = $message, d.graphUpdatedAt = datetime()",
+                String query = isBlank(runId)
+                        ? "MERGE (d:KnowledgeDocument {id: $documentId}) " +
+                          "SET d.version = $version, d.graphStatus = $status, " +
+                          "    d.graphErrorMessage = $message, d.graphUpdatedAt = datetime()"
+                        : "MATCH (d:KnowledgeDocument {id: $documentId}) " +
+                          "WHERE d.version = $version AND d.graphRunId = $runId " +
+                          "SET d.graphStatus = $status, d.graphErrorMessage = $message, " +
+                          "    d.graphUpdatedAt = datetime()";
+                tx.run(query,
                         Values.parameters(
                                 "documentId", documentId,
                                 "version", version == null ? 1 : version,
                                 "status", firstNonBlank(status, "unknown"),
-                                "message", firstNonBlank(message, "")));
+                                "message", firstNonBlank(message, ""),
+                                "runId", firstNonBlank(runId, "")));
                 return null;
             });
+        }
+    }
+
+    public boolean tryStartDocumentGraphExtraction(
+            String documentId,
+            Integer version,
+            String runId,
+            boolean force) {
+        if (!properties.isSyncEnabled() || isBlank(documentId) || isBlank(runId)) {
+            return false;
+        }
+        try (Session session = driver.session(sessionConfig())) {
+            session.writeTransaction(tx -> {
+                ensureConstraints(tx);
+                return null;
+            });
+            return session.writeTransaction(tx -> tx.run(
+                    "MERGE (d:KnowledgeDocument {id: $documentId}) " +
+                            "ON CREATE SET d.version = 0, d.graphStatus = 'none' " +
+                            "WITH d " +
+                            "WHERE coalesce(d.version, 0) < $version " +
+                            "   OR (d.version = $version AND (" +
+                            "       coalesce(d.graphStatus, 'none') IN ['none', 'failed'] " +
+                            "       OR ($force AND coalesce(d.graphStatus, 'none') <> 'running'))) " +
+                            "SET d.version = $version, d.graphRunId = $runId, " +
+                            "    d.graphStatus = 'running', d.graphErrorMessage = '', " +
+                            "    d.graphUpdatedAt = datetime() " +
+                            "RETURN count(d) AS started",
+                    Values.parameters(
+                            "documentId", documentId,
+                            "version", version == null ? 1 : version,
+                            "runId", runId,
+                            "force", force)
+            ).single().get("started").asLong(0L) == 1L);
         }
     }
 
@@ -430,6 +743,7 @@ public class Neo4jRecommendationGraphClient {
                 Map<String, Object> result = new HashMap<>();
                 List<Record> records = tx.run(
                         "MATCH (d:KnowledgeDocument {id: $documentId}) " +
+                                "WHERE d.version = $version " +
                                 "OPTIONAL MATCH (d)-[:HAS_CHUNK]->(:Chunk)-[:MENTIONS]->(kp:KnowledgePoint) " +
                                 "OPTIONAL MATCH (:KnowledgePoint)-[r:PREREQUISITE_OF|RELATED_TO|CONTAINS|CONFUSED_WITH]-(:KnowledgePoint) " +
                                 "WHERE r.documentId = $documentId " +
@@ -439,7 +753,9 @@ public class Neo4jRecommendationGraphClient {
                                 "       count(DISTINCT kp) AS nodeCount, count(DISTINCT r) AS relationCount, " +
                                 "       coalesce(d.graphPendingCount, 0) AS pendingCount " +
                                 "LIMIT 1",
-                        Values.parameters("documentId", documentId)
+                        Values.parameters(
+                                "documentId", documentId,
+                                "version", version == null ? 1 : version)
                 ).list();
                 if (records.isEmpty()) {
                     result.put("graphStatus", "none");
@@ -470,6 +786,7 @@ public class Neo4jRecommendationGraphClient {
             String knowledgeBaseId,
             String fileName,
             Integer version,
+            String runId,
             Map<String, Object> graph) {
         if (!properties.isSyncEnabled()) {
             throw new IllegalStateException("Neo4j 图谱同步未启用");
@@ -483,10 +800,23 @@ public class Neo4jRecommendationGraphClient {
                 return null;
             });
             session.writeTransaction(tx -> {
-                tx.run("MERGE (u:User {id: $userId}) " +
-                                "MERGE (d:KnowledgeDocument {id: $documentId}) " +
-                                "SET d.knowledgeBaseId = $knowledgeBaseId, d.name = $fileName, d.version = $version, " +
-                                "    d.graphStatus = 'running', d.graphErrorMessage = '', d.graphUpdatedAt = datetime() " +
+                long writable = tx.run(
+                        "MATCH (d:KnowledgeDocument {id: $documentId}) " +
+                                "WHERE d.version = $version AND d.graphRunId = $runId " +
+                                "  AND d.graphStatus = 'running' " +
+                                "SET d.graphUpdatedAt = datetime() " +
+                                "RETURN count(d) AS writable",
+                        Values.parameters(
+                                "documentId", documentId,
+                                "version", version == null ? 1 : version,
+                                "runId", firstNonBlank(runId, ""))
+                ).single().get("writable").asLong(0L);
+                if (writable != 1L) {
+                    throw new IllegalStateException("Stale or duplicate graph extraction task");
+                }
+                tx.run("MATCH (d:KnowledgeDocument {id: $documentId}) " +
+                                "MERGE (u:User {id: $userId}) " +
+                                "SET d.knowledgeBaseId = $knowledgeBaseId, d.name = $fileName " +
                                 "MERGE (u)-[:OWNS_DOCUMENT]->(d)",
                         Values.parameters(
                                 "userId", String.valueOf(userId),
@@ -495,17 +825,26 @@ public class Neo4jRecommendationGraphClient {
                                 "fileName", firstNonBlank(fileName, documentId),
                                 "version", version == null ? 1 : version));
                 clearDocumentGeneratedGraph(tx, documentId);
-                syncKgEntityNodes(tx, graph);
+                syncKgEntityNodes(
+                        tx,
+                        userId,
+                        documentId,
+                        knowledgeBaseId,
+                        version == null ? 1 : version,
+                        graph);
                 syncKgChunks(tx, documentId, knowledgeBaseId, graph);
                 syncKgMentions(tx, documentId, graph);
                 syncKgBusinessRelations(tx, documentId, graph);
                 syncWrongQuestionAlignments(tx, userId, documentId, graph);
                 tx.run("MATCH (d:KnowledgeDocument {id: $documentId}) " +
+                                "WHERE d.version = $version AND d.graphRunId = $runId " +
                                 "SET d.graphStatus = 'completed', d.graphNodeCount = $nodeCount, " +
                                 "    d.graphRelationCount = $edgeCount, d.graphPendingCount = $pendingCount, " +
                                 "    d.graphUpdatedAt = datetime()",
                         Values.parameters(
                                 "documentId", documentId,
+                                "version", version == null ? 1 : version,
+                                "runId", firstNonBlank(runId, ""),
                                 "nodeCount", asList(graph.get("entity_nodes")).size(),
                                 "edgeCount", countBusinessEntityRelations(graph),
                                 "pendingCount", 0));
@@ -571,7 +910,13 @@ public class Neo4jRecommendationGraphClient {
                 Values.parameters("documentId", documentId));
     }
 
-    private void syncKgEntityNodes(Transaction tx, Map<String, Object> graph) {
+    private void syncKgEntityNodes(
+            Transaction tx,
+            Integer userId,
+            String documentId,
+            String knowledgeBaseId,
+            Integer version,
+            Map<String, Object> graph) {
         for (Map<String, Object> raw : asList(graph.get("entity_nodes"))) {
             String id = string(raw.get("entity_id"));
             String canonicalName = firstNonBlank(string(raw.get("canonical_name")), string(raw.get("name")));
@@ -589,12 +934,18 @@ public class Neo4jRecommendationGraphClient {
             params.put("disambiguationKey", firstNonBlank(string(raw.get("disambiguation_key")), ""));
             params.put("source", "knowledge_base");
             params.put("confidence", 0.75);
+            params.put("ownerUserId", String.valueOf(userId));
+            params.put("documentId", documentId);
+            params.put("knowledgeBaseId", firstNonBlank(knowledgeBaseId, ""));
+            params.put("version", version);
             tx.run("MERGE (kp:KnowledgePoint {id: $id}) " +
                             "SET kp.name = CASE WHEN kp.labelSource = 'manual' THEN kp.name ELSE $name END, " +
                             "    kp.canonicalName = CASE WHEN kp.labelSource = 'manual' THEN coalesce(kp.canonicalName, kp.name) ELSE $canonicalName END, " +
                             "    kp.aliases = $aliases, kp.subject = $subject, kp.definition = $definition, " +
                             "    kp.headingPath = $headingPath, kp.disambiguationKey = $disambiguationKey, " +
                             "    kp.source = CASE WHEN coalesce(kp.source, '') = 'manual' THEN kp.source ELSE $source END, " +
+                            "    kp.ownerUserId = $ownerUserId, kp.documentId = $documentId, " +
+                            "    kp.knowledgeBaseId = $knowledgeBaseId, kp.documentVersion = $version, " +
                             "    kp.confidence = $confidence, kp.resolutionStatus = 'new', " +
                             "    kp.resolutionMethod = 'kg_structure', kp.resolutionConfidence = $confidence, " +
                             "    kp.updatedAt = datetime()",
@@ -666,6 +1017,11 @@ public class Neo4jRecommendationGraphClient {
             String target = string(raw.get("object"));
             String predicate = string(raw.get("predicate"));
             String relationType = relationTypeFromKgPredicate(predicate);
+            if (isInverseContainsPredicate(predicate)) {
+                String contained = source;
+                source = target;
+                target = contained;
+            }
             if (!source.startsWith("entity:")
                     || !target.startsWith("entity:")
                     || relationType == null
@@ -688,8 +1044,16 @@ public class Neo4jRecommendationGraphClient {
                             "MATCH (target:KnowledgePoint {id: $targetId}) " +
                             "MERGE (source)-[r:" + relationType + "]->(target) " +
                             "FOREACH (_ IN CASE WHEN coalesce(r.source, '') = 'manual' THEN [] ELSE [1] END | " +
-                            "  SET r.id = $edgeId, r.weight = $weight, r.confidence = $confidence, " +
-                            "      r.label = $label, r.evidence = $evidence, r.chunkId = $chunkId, " +
+                            "  SET r.id = $edgeId, " +
+                            "      r.weight = CASE WHEN coalesce(r.weight, 0.0) < $weight THEN $weight ELSE r.weight END, " +
+                            "      r.confidence = CASE WHEN coalesce(r.confidence, 0.0) < $confidence THEN $confidence ELSE r.confidence END, " +
+                            "      r.label = $label, " +
+                            "      r.evidence = CASE WHEN coalesce(r.evidence, '') = '' THEN $evidence ELSE r.evidence END, " +
+                            "      r.chunkId = CASE WHEN coalesce(r.chunkId, '') = '' THEN $chunkId ELSE r.chunkId END, " +
+                            "      r.chunkIds = CASE WHEN $chunkId = '' OR $chunkId IN coalesce(r.chunkIds, []) " +
+                            "          THEN coalesce(r.chunkIds, []) ELSE coalesce(r.chunkIds, []) + [$chunkId] END, " +
+                            "      r.evidences = CASE WHEN $evidence = '' OR $evidence IN coalesce(r.evidences, []) " +
+                            "          THEN coalesce(r.evidences, []) ELSE coalesce(r.evidences, []) + [$evidence] END, " +
                             "      r.documentId = $documentId, r.page = $page, " +
                             "      r.contextDependency = $contextDependency, r.source = 'knowledge_base', " +
                             "      r.reason = 'kg_structure_extraction', r.updatedAt = datetime())",
@@ -710,7 +1074,7 @@ public class Neo4jRecommendationGraphClient {
             knowledgePointId = firstNonBlank(knowledgePointId, string(raw.get("entity_id")));
             knowledgePointId = firstNonBlank(knowledgePointId, string(raw.get("entityId")));
             double confidence = number(raw.get("confidence"), 0.0);
-            if (isBlank(questionId) || isBlank(knowledgePointId) || confidence < 0.55) {
+            if (isBlank(questionId) || isBlank(knowledgePointId) || confidence < 0.60) {
                 continue;
             }
             int score = (int) Math.round(58 + confidence * 34);
@@ -730,7 +1094,9 @@ public class Neo4jRecommendationGraphClient {
                     firstNonBlank(string(raw.get("mapping_method")), string(raw.get("mappingMethod"))),
                     "llm_semantic_alignment"));
             tx.run("MATCH (u:User {id: $userId})-[wo:WRONG_ON]->(q:Question {id: $questionId}) " +
-                            "MATCH (kp:KnowledgePoint {id: $knowledgePointId}) " +
+                            "MATCH (u)-[:OWNS_DOCUMENT]->(d:KnowledgeDocument {id: $documentId}) " +
+                            "MATCH (d)-[:HAS_CHUNK]->(:Chunk)-[:MENTIONS]->" +
+                            "(kp:KnowledgePoint {id: $knowledgePointId}) " +
                             "MERGE (q)-[r:TESTS]->(kp) " +
                             "SET r.confidence = $confidence, r.weight = $confidence, " +
                             "    r.evidence = $evidence, r.reason = $reason, " +
@@ -752,7 +1118,10 @@ public class Neo4jRecommendationGraphClient {
                 ? "wrong-" + userId + "-" + knowledgeName
                 : String.valueOf(evidence.getQuestionId());
         String subject = firstNonBlank(evidence.getSubjectName(), "\u901a\u7528");
-        String knowledgeId = resolveKnowledgePointId(tx, subject, knowledgeName);
+        // Legacy question categories must never resolve to another user's
+        // document-scoped knowledge point. Qwen alignments create explicit
+        // TESTS relationships to the selected knowledge base later.
+        String knowledgeId = knowledgePointId(subject, knowledgeName);
         int errorCount = evidence.getErrorCount() == null ? 1 : evidence.getErrorCount();
         int score = scoreEvidence(evidence);
         int mastery = Math.max(5, 100 - score);
@@ -779,13 +1148,50 @@ public class Neo4jRecommendationGraphClient {
                         "    kp.canonicalName = coalesce(kp.canonicalName, $kpName), " +
                         "    kp.subject = $subject, kp.category = $category, " +
                         "    kp.level = 1, kp.importance = 'medium', kp.source = coalesce(kp.source, 'wrong_question') " +
-                        "MERGE (q)-[t:TESTS]->(kp) SET t.weight = 1.0 " +
+                        "MERGE (q)-[t:TESTS]->(kp) " +
+                        "SET t.weight = 1.0, t.score = $score, t.source = 'wrong_question_category' " +
                         "MERGE (u)-[wo:WRONG_ON]->(q) SET wo.errorCount = $errorCount, wo.lastWrongTime = $lastWrongTime " +
                         "MERGE (u)-[w:WEAK_AT]->(kp) " +
-                        "SET w.score = coalesce(w.score, 0) + $score, " +
-                        "    w.errorCount = coalesce(w.errorCount, 0) + $errorCount, " +
-                        "    w.mastery = $mastery",
+                        "SET w.score = $score, w.errorCount = $errorCount, w.mastery = $mastery",
                 params);
+    }
+
+    public void moveDocumentKnowledgeGraph(
+            Integer userId,
+            String documentId,
+            String knowledgeBaseId) {
+        if (!properties.isSyncEnabled() || isBlank(documentId) || isBlank(knowledgeBaseId)) {
+            return;
+        }
+        try (Session session = driver.session(sessionConfig())) {
+            session.writeTransaction(tx -> {
+                tx.run("MATCH (u:User {id: $userId})-[:OWNS_DOCUMENT]->(d:KnowledgeDocument {id: $documentId}) " +
+                                "SET d.knowledgeBaseId = $knowledgeBaseId " +
+                                "WITH d OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:Chunk) " +
+                                "SET c.knowledgeBaseId = $knowledgeBaseId " +
+                                "WITH d, c OPTIONAL MATCH (c)-[:MENTIONS]->(kp:KnowledgePoint) " +
+                                "SET kp.knowledgeBaseId = $knowledgeBaseId",
+                        Values.parameters(
+                                "userId", String.valueOf(userId),
+                                "documentId", documentId,
+                                "knowledgeBaseId", knowledgeBaseId));
+                return null;
+            });
+        }
+    }
+
+    private void recalculateWeakRelations(Transaction tx, Integer userId) {
+        tx.run("MATCH (u:User {id: $userId})-[wo:WRONG_ON]->(q:Question)-[t:TESTS]->(kp:KnowledgePoint) " +
+                        "WHERE t.source = 'wrong_question_category' " +
+                        "   OR coalesce(kp.ownerUserId, '') = $userId " +
+                        "WITH u, kp, sum(coalesce(t.score, 58 + coalesce(t.confidence, 0.0) * 34)) AS rawScore, " +
+                        "     sum(coalesce(wo.errorCount, 1)) AS errors " +
+                        "MERGE (u)-[w:WEAK_AT]->(kp) " +
+                        "SET w.score = toInteger(CASE WHEN rawScore > 100 THEN 100 ELSE rawScore END), " +
+                        "    w.errorCount = toInteger(errors), " +
+                        "    w.mastery = toInteger(CASE WHEN rawScore > 95 THEN 5 ELSE 100 - rawScore END), " +
+                        "    w.updatedAt = datetime()",
+                Values.parameters("userId", String.valueOf(userId)));
     }
 
     private void clearUserGeneratedRelations(Transaction tx, Integer userId) {
@@ -969,7 +1375,7 @@ public class Neo4jRecommendationGraphClient {
 
     private String knowledgePointId(String subjectName, String knowledgeName) {
         String subject = firstNonBlank(subjectName, "\u901a\u7528");
-        return "kp:" + subject + ":" + knowledgeName;
+        return "legacy:kp:" + subject + ":" + knowledgeName;
     }
 
     private String resolveKnowledgePointId(Transaction tx, String subjectName, String knowledgeName) {
@@ -1047,6 +1453,10 @@ public class Neo4jRecommendationGraphClient {
             return null;
         }
         return "RELATED_TO";
+    }
+
+    private boolean isInverseContainsPredicate(String predicate) {
+        return !isBlank(predicate) && predicate.contains("属于");
     }
 
     private String firstHeading(Map<String, Object> raw) {

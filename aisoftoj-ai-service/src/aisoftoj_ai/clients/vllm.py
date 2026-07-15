@@ -1,5 +1,6 @@
 import json
 from collections.abc import AsyncIterator
+from typing import Any
 
 import httpx
 
@@ -80,18 +81,22 @@ class VllmChat:
         self,
         messages: list[dict[str, str]],
         temperature: float = 0.1,
+        response_format: dict[str, Any] | None = None,
     ) -> str:
         """一次性获取完整回答。"""
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        if response_format is not None:
+            payload["response_format"] = response_format
         async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
             response = await client.post(
                 self.url,
                 headers=self.headers,
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "chat_template_kwargs": {"enable_thinking": False},
-                },
+                json=payload,
             )
             response.raise_for_status()
             return response.json()["choices"][0]["message"]["content"].strip()

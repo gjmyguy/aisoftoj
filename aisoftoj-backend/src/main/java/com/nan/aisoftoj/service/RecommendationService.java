@@ -12,7 +12,13 @@ import java.util.List;
 public interface RecommendationService {
     List<KnowledgePointRecommendationDTO> listKnowledgePointRecommendations(Integer userId);
 
+    List<KnowledgePointRecommendationDTO> listKnowledgePointRecommendations(
+            Integer userId,
+            Long knowledgeBaseId);
+
     KnowledgeGraphDTO getKnowledgeGraph(Integer userId, String scope);
+
+    KnowledgeGraphDTO getKnowledgeGraph(Integer userId, String scope, Long knowledgeBaseId);
 
     KnowledgeGraphDTO updateKnowledgeGraphNode(
             Integer userId,

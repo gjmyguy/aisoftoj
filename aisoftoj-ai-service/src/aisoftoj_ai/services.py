@@ -22,6 +22,7 @@ class Services:
     reranker: Reranker
     search: HybridSearch
     searxng: Searxng
+    storage: LocalStorage
     pipeline: IngestionPipeline
 
 
@@ -49,6 +50,10 @@ def get_services() -> Services:
         settings.reranker_api_key,
         settings.reranker_model,
     )
+    storage = LocalStorage(
+        settings.local_storage_dir,
+        settings.local_storage_base_url,
+    )
     pipeline = IngestionPipeline(
         mineru=Mineru(
             settings.mineru_url,
@@ -56,10 +61,7 @@ def get_services() -> Services:
         ),
         store=store,
         embedding=embedding,
-        storage=LocalStorage(
-            settings.local_storage_dir,
-            settings.local_storage_base_url,
-        ),
+        storage=storage,
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
     )
@@ -76,5 +78,6 @@ def get_services() -> Services:
             settings.rerank_limit,
         ),
         searxng=Searxng(settings.searxng_url),
+        storage=storage,
         pipeline=pipeline,
     )

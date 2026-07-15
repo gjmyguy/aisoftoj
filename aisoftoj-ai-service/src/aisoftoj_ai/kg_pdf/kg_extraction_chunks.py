@@ -7,6 +7,7 @@ from aisoftoj_ai.kg_pdf.models import KgBlockBinding, KgExtractionChunk
 def build_kg_extraction_chunks(
     document_id: str,
     bindings: list[KgBlockBinding],
+    version: int = 1,
     max_group_chars: int = 2400,
 ) -> list[KgExtractionChunk]:
     """Create structure-bound KG chunks from natural paragraph groups."""
@@ -24,7 +25,7 @@ def build_kg_extraction_chunks(
         page_start = min(pages) if pages else None
         page_end = max(pages) if pages else None
         index = len(chunks) + 1
-        chunk_id = _chunk_id(document_id, page_start, index, text)
+        chunk_id = _chunk_id(document_id, version, page_start, index, text)
         chunks.append(
             KgExtractionChunk(
                 document_id=document_id,
@@ -84,10 +85,18 @@ def _paragraphs(text: str) -> list[str]:
     return [part.strip() for part in re.split(r"\n\s*\n+", text) if part.strip()]
 
 
-def _chunk_id(document_id: str, page_start: int | None, index: int, text: str) -> str:
-    digest = hashlib.sha1(f"{document_id}|{index}|{text}".encode()).hexdigest()[:8]
+def _chunk_id(
+    document_id: str,
+    version: int,
+    page_start: int | None,
+    index: int,
+    text: str,
+) -> str:
+    digest = hashlib.sha1(
+        f"{document_id}|{version}|{index}|{text}".encode()
+    ).hexdigest()[:8]
     page = page_start if page_start is not None else "unknown"
-    return f"kg_chunk_page_{page}_{index:03d}_{digest}"
+    return f"kg_chunk_v{version}_page_{page}_{index:03d}_{digest}"
 
 
 def _page_range(start: int | None, end: int | None) -> str:

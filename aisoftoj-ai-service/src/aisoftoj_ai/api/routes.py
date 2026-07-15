@@ -19,6 +19,7 @@ from aisoftoj_ai.api.schemas import (
     UrlIngestRequest,
     WrongQuestionAlignmentRequest,
 )
+from aisoftoj_ai.config import get_settings
 from aisoftoj_ai.kg_pdf.workflow import run_kg_pdf_extraction
 from aisoftoj_ai.kg_pdf.wrong_question_aligner import align_wrong_questions_to_kg
 from aisoftoj_ai.rag.tasks import state_key
@@ -42,6 +43,7 @@ async def upload_document(
     options_json: str = Form("{}"),
 ) -> JobResponse:
     """接收上传文件并创建入库任务。"""
+    redis = _require_redis(request)
     upload_dir = Path("./data/uploads")
     upload_dir.mkdir(parents=True, exist_ok=True)
     suffix = Path(file.filename or "").suffix
@@ -55,7 +57,7 @@ async def upload_document(
     except Exception as exc:
         target.unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail=f"Invalid parse options: {exc}") from exc
-    job = await request.app.state.redis.enqueue_job(
+    job = await redis.enqueue_job(
         "ingest_file_task",
         str(target),
         knowledge_base_id,
@@ -66,7 +68,7 @@ async def upload_document(
     )
     if job is None:
         target.unlink(missing_ok=True)
-        existing = Job(f"ingest-{document_id}-{version}", request.app.state.redis)
+        existing = Job(f"ingest-{document_id}-{version}", redis)
         return JobResponse(job_id=existing.job_id, status=(await existing.status()).value)
     return JobResponse(job_id=job.job_id, status="queued")
 
@@ -74,7 +76,8 @@ async def upload_document(
 @router.post("/index/jobs/url", response_model=JobResponse, status_code=202)
 async def ingest_url(request: Request, body: UrlIngestRequest) -> JobResponse:
     """接收 URL 并创建入库任务。"""
-    job = await request.app.state.redis.enqueue_job(
+    redis = _require_redis(request)
+    job = await redis.enqueue_job(
         "ingest_url_task",
         str(body.url),
         body.knowledge_base_id,
@@ -87,9 +90,10 @@ async def ingest_url(request: Request, body: UrlIngestRequest) -> JobResponse:
 @router.get("/index/jobs/{job_id}")
 async def get_job(request: Request, job_id: str) -> dict:
     """查询 ARQ 任务状态和结果。"""
-    job = Job(job_id, request.app.state.redis)
+    redis = _require_redis(request)
+    job = Job(job_id, redis)
     status = await job.status()
-    state = await request.app.state.redis.hgetall(
+    state = await redis.hgetall(
         state_key_from_job(job_id)
     ) if job_id.startswith("ingest-") else {}
     progress = {
@@ -144,9 +148,10 @@ async def get_job(request: Request, job_id: str) -> dict:
 
 @router.post("/index/jobs/{job_id}/cancel")
 async def cancel_job(request: Request, job_id: str) -> dict:
+    redis = _require_redis(request)
     key = state_key_from_job(job_id)
     await hset_fields(
-        request.app.state.redis,
+        redis,
         key,
         {"cancelled": "true", "status": "cancelled"},
     )
@@ -155,6 +160,17 @@ async def cancel_job(request: Request, job_id: str) -> dict:
 
 @router.get("/index/capabilities")
 async def index_capabilities() -> dict:
+    if get_settings().qwen_only_mode:
+        return {
+            "mode": "qwen_only",
+            "mineru": {"available": False},
+            "parseOptionsSchema": {},
+            "presets": {},
+            "message": (
+                "MinerU is disabled; KG extraction requires existing "
+                "markdown/content-list artifacts."
+            ),
+        }
     openapi = await get_services().pipeline.mineru.capabilities()
     schemas = openapi.get("components", {}).get("schemas", {})
     upload_schema = next(
@@ -223,8 +239,10 @@ async def get_document_asset(document_id: str, version: int, filename: str):
 @router.delete("/index/documents/{document_id}")
 async def delete_document(document_id: str) -> dict:
     """删除指定文档的索引数据。"""
-    await get_services().store.delete_document(document_id)
-    await get_services().pipeline.storage.delete_prefix(f"documents/{document_id}")
+    services = get_services()
+    if not get_settings().qwen_only_mode:
+        await services.store.delete_document(document_id)
+    await services.storage.delete_prefix(f"documents/{document_id}")
     return {"message": "文档索引已删除"}
 
 
@@ -233,7 +251,8 @@ async def move_document(document_id: str, body: dict) -> dict:
     knowledge_base_id = str(body.get("knowledgeBaseId") or "").strip()
     if not knowledge_base_id:
         raise HTTPException(status_code=422, detail="knowledgeBaseId is required")
-    await get_services().store.move_document(document_id, knowledge_base_id)
+    if not get_settings().qwen_only_mode:
+        await get_services().store.move_document(document_id, knowledge_base_id)
     return {"documentId": document_id, "knowledgeBaseId": knowledge_base_id}
 
 
@@ -247,6 +266,7 @@ async def list_chunks(document_id: str, limit: int = 100) -> dict:
 @router.post("/retrieval/search", response_model=SearchResponse)
 async def search(body: SearchRequest) -> SearchResponse:
     """执行知识库混合检索。"""
+    _require_full_mode("检索依赖 embedding、reranker 和 Qdrant")
     results = await get_services().search.search(
         body.query,
         body.knowledge_base_ids,
@@ -258,6 +278,7 @@ async def search(body: SearchRequest) -> SearchResponse:
 @router.post("/chat/stream")
 async def chat_stream(body: ChatRequest, request: Request) -> StreamingResponse:
     """SSE 流式对话接口，由统一备考 Agent 决定工具调用。"""
+    redis = _require_redis(request)
     services = get_services()
     trace_id = str(uuid.uuid4())
 
@@ -265,7 +286,7 @@ async def chat_stream(body: ChatRequest, request: Request) -> StreamingResponse:
         """生成对话过程中的 SSE 事件流。"""
         yield _sse("status", {"message": "正在理解问题", "traceId": trace_id})
         try:
-            async for data in stream_study_agent(body, services, request.app.state.redis, trace_id):
+            async for data in stream_study_agent(body, services, redis, trace_id):
                 yield _sse(data["type"], data)
             yield _sse("done", {"traceId": trace_id})
         except Exception as exc:
@@ -298,7 +319,7 @@ async def recommendation_knowledge_graph(body: KnowledgeGraphAgentRequest) -> di
     services = get_services()
     return await build_knowledge_graph_relations(
         services.chat,
-        services.search,
+        None if get_settings().qwen_only_mode else services.search,
         body.recommendations,
         body.evidences,
         body.knowledge_base_ids,
@@ -317,8 +338,8 @@ async def extract_document_knowledge_graph(body: DocumentGraphExtractionRequest)
     """
     services = get_services()
     artifact_prefix = f"documents/{body.document_id}/{body.version}"
-    content_list_path = services.pipeline.storage.path(f"{artifact_prefix}/content-list.json")
-    markdown_path = services.pipeline.storage.path(f"{artifact_prefix}/document.md")
+    content_list_path = services.storage.path(f"{artifact_prefix}/content-list.json")
+    markdown_path = services.storage.path(f"{artifact_prefix}/document.md")
     if not content_list_path.exists() and not markdown_path.exists():
         raise HTTPException(status_code=404, detail="Document parse artifacts not found")
 
@@ -335,10 +356,11 @@ async def extract_document_knowledge_graph(body: DocumentGraphExtractionRequest)
     result = await run_kg_pdf_extraction(
         services.chat,
         body.document_id,
+        version=body.version,
         content_list=content_list,
         markdown=markdown,
         document_title=body.document_title,
-        max_chunks=body.max_chunks,
+        chunk_batch_size=body.chunk_batch_size,
     )
     payload = result.model_dump()
     payload["knowledgeBaseId"] = body.knowledge_base_id
@@ -369,6 +391,24 @@ async def align_wrong_questions_to_document_kg(body: WrongQuestionAlignmentReque
 def _sse(event: str, data: dict) -> str:
     """将事件包装为 SSE 格式。"""
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _require_redis(request: Request):
+    redis = getattr(request.app.state, "redis", None)
+    if redis is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "This endpoint is disabled in Qwen-only mode because "
+                "Redis/ingestion dependencies are unavailable."
+            ),
+        )
+    return redis
+
+
+def _require_full_mode(detail: str) -> None:
+    if get_settings().qwen_only_mode:
+        raise HTTPException(status_code=503, detail=f"{detail}；当前为 Qwen-only 模式")
 
 
 def state_key_from_job(job_id: str) -> str:

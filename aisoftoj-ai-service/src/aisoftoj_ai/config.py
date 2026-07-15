@@ -17,7 +17,11 @@ class Settings(BaseSettings):
         "http://localhost:5173,http://127.0.0.1:5173"
     )
 
-    qdrant_url: str
+    # Qwen-only mode keeps document KG extraction/alignment available while
+    # Redis, Qdrant, MinerU, embedding and reranker services are offline.
+    qwen_only_mode: bool = False
+
+    qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str = ""
     qdrant_collection: str = "aisoftoj_knowledge"
     qdrant_upsert_max_bytes: int = 24 * 1024 * 1024
@@ -25,7 +29,7 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/0"
 
-    mineru_url: str
+    mineru_url: str = "http://localhost:8000"
     mineru_poll_interval_seconds: float = 2.0
     mineru_task_timeout_seconds: int = 3600
 

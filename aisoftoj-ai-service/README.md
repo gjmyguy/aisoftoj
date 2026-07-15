@@ -35,6 +35,21 @@ uv run uvicorn aisoftoj_ai.main:app --reload --host 0.0.0.0 --port 8090
 uv run arq aisoftoj_ai.worker.WorkerSettings
 ```
 
+### 仅 Qwen-VL 模式
+
+当服务器只有兼容 OpenAI Chat Completions 的 Qwen-VL 可用时，在 `.env` 设置：
+
+```dotenv
+QWEN_ONLY_MODE=true
+CHAT_BASE_URL=http://你的-qwen-vl-服务/v1
+CHAT_MODEL=服务实际暴露的模型名
+```
+
+该模式不会在启动时连接 Redis/Qdrant，也不会调用 MinerU、embedding 或 reranker。
+可用能力包括：基于已有 `content-list.json` / `document.md` 的文档图谱抽取，以及
+“本地词法召回 + Qwen-VL 判断”的错题知识点对齐。上传解析、向量检索和 RAG 问答接口
+会明确返回 503。
+
 ## 服务边界
 
 - 浏览器只访问 Java API。

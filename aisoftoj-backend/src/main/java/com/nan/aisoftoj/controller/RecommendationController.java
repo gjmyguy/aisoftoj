@@ -36,15 +36,22 @@ public class RecommendationController {
 
     @GetMapping("/knowledge-points")
     public ResultDTO<List<KnowledgePointRecommendationDTO>> listKnowledgePointRecommendations(
+            @RequestParam(required = false) Long knowledgeBaseId,
             HttpServletRequest request) {
-        return ResultDTO.success(recommendationService.listKnowledgePointRecommendations(currentUserId(request)));
+        return ResultDTO.success(recommendationService.listKnowledgePointRecommendations(
+                currentUserId(request),
+                knowledgeBaseId));
     }
 
     @GetMapping("/knowledge-graph")
     public ResultDTO<KnowledgeGraphDTO> getKnowledgeGraph(
             @RequestParam(defaultValue = "focus") String scope,
+            @RequestParam(required = false) Long knowledgeBaseId,
             HttpServletRequest request) {
-        return ResultDTO.success(recommendationService.getKnowledgeGraph(currentUserId(request), scope));
+        return ResultDTO.success(recommendationService.getKnowledgeGraph(
+                currentUserId(request),
+                scope,
+                knowledgeBaseId));
     }
 
     @PatchMapping("/knowledge-graph/nodes/{nodeId}")

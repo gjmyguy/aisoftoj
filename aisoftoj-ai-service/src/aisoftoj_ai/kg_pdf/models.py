@@ -86,6 +86,7 @@ class KgEvidenceRelation(BaseModel):
 class KgExtractionResult(BaseModel):
     status: str = "completed"
     document_id: str
+    version: int = 1
     document_structure: KgDocumentStructure
     kg_extraction_chunks: list[KgExtractionChunk]
     entity_nodes: list[KgEntityNode] = Field(default_factory=list)

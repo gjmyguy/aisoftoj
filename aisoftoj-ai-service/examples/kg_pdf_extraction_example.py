@@ -2,6 +2,7 @@ import asyncio
 import json
 
 from aisoftoj_ai.kg_pdf.workflow import run_kg_pdf_extraction
+from aisoftoj_ai.services import get_services
 
 
 async def main() -> None:
@@ -19,11 +20,11 @@ async def main() -> None:
         },
     ]
     result = await run_kg_pdf_extraction(
-        chat=None,
+        chat=get_services().chat,
         document_id="demo-risk",
         content_list=content_list,
         document_title="系统架构设计师教程",
-        max_chunks=8,
+        chunk_batch_size=8,
     )
     print(json.dumps(result.model_dump(), ensure_ascii=False, indent=2))
 

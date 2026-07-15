@@ -1,7 +1,6 @@
 import asyncio
 import hashlib
 import json
-import logging
 import re
 import unicodedata
 from typing import Any
@@ -15,111 +14,166 @@ from aisoftoj_ai.kg_pdf.models import (
 )
 
 KG_RELATION_EXTRACTION_SYSTEM_PROMPT = """
-你是结构感知的 PDF 知识图谱实体关系抽取器。
-只能依据输入正文和结构上下文抽取，返回严格 JSON，不要输出 Markdown。
-
-输出 schema:
-{
-  "entities": [
-    {
-      "name": "实体规范候选名",
-      "aliases": ["别名"],
-      "evidence_text": "当前正文中的短证据",
-      "context_dependency": "explicit|heading_context|cross_chunk_context",
-      "confidence": 0.0
-    }
-  ],
-  "relations": [
-    {
-      "subject": "实体名",
-      "predicate": "关系",
-      "object": "实体名",
-      "evidence_text": "当前正文中的短证据",
-      "context_dependency": "explicit|heading_context|cross_chunk_context",
-      "confidence": 0.0
-    }
-  ]
-}
-
-要求:
-1. 区分显式正文关系、依赖标题上下文关系、跨 chunk 上下文关系。
-2. 不要把标题当作正文证据，但可以作为 heading_context 依赖。
-3. 每条业务关系必须有当前 chunk 证据；不确定就降低 confidence。
-4. 优先抽取软考/软件工程/项目管理等领域概念。
+从当前正文抽取软考领域知识点和关系，只返回符合 schema 的 JSON。
+规则：
+1. 实体名使用正文中的规范概念名，别名只记录明确出现的简称或同义名。
+2. predicate 只能是 PREREQUISITE_OF、CONTAINS、CONFUSED_WITH、RELATED_TO。
+3. PREREQUISITE_OF 表示 subject 是 object 的前置知识；CONTAINS 表示 subject 包含 object。
+4. 标题和相邻摘要只用于消歧，不能作为 evidence_text；关系证据必须来自当前正文。
+5. 没有明确证据就不输出，不要补充常识，不要输出重复实体或重复关系。
 """
 
-logger = logging.getLogger("aisoftoj.kg_pdf.relation_extractor")
+KG_EXTRACTION_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "kg_chunk_extraction",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "entities": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "name": {"type": "string"},
+                            "aliases": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["name", "aliases"],
+                    },
+                },
+                "relations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "subject": {"type": "string"},
+                            "predicate": {
+                                "type": "string",
+                                "enum": [
+                                    "PREREQUISITE_OF",
+                                    "CONTAINS",
+                                    "CONFUSED_WITH",
+                                    "RELATED_TO",
+                                ],
+                            },
+                            "object": {"type": "string"},
+                            "evidence_text": {"type": "string"},
+                            "context_dependency": {
+                                "type": "string",
+                                "enum": [
+                                    "explicit",
+                                    "heading_context",
+                                    "cross_chunk_context",
+                                ],
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "minimum": 0,
+                                "maximum": 1,
+                            },
+                        },
+                        "required": [
+                            "subject",
+                            "predicate",
+                            "object",
+                            "evidence_text",
+                            "context_dependency",
+                            "confidence",
+                        ],
+                    },
+                },
+            },
+            "required": ["entities", "relations"],
+        },
+    },
+}
+
 DEFAULT_EXTRACTION_CONCURRENCY = 8
 DEFAULT_CHUNK_TIMEOUT_SECONDS = 45.0
 
 
 def build_kg_relation_prompt(document_title: str, chunk: KgExtractionChunk) -> str:
-    return (
-        f"文档标题：{document_title}\n"
-        f"标题路径：{' > '.join(chunk.heading_path)}\n"
-        f"所属结构节点：{chunk.parent_heading_id}\n"
-        f"页码范围：{chunk.source_page_range}\n"
-        f"上一个抽取单元摘要：{chunk.previous_context_summary}\n"
-        f"当前抽取单元正文：\n{chunk.text}\n"
-        f"下一个抽取单元摘要：{chunk.next_context_summary}\n"
-    )
+    context = [
+        f"文档：{document_title}",
+        f"章节：{' > '.join(chunk.heading_path)}",
+        f"页码：{chunk.source_page_range}",
+    ]
+    if chunk.previous_context_summary:
+        context.append(f"上文摘要（仅消歧）：{chunk.previous_context_summary}")
+    if chunk.next_context_summary:
+        context.append(f"下文摘要（仅消歧）：{chunk.next_context_summary}")
+    context.append(f"当前正文（唯一证据来源）：\n{chunk.text}")
+    return "\n".join(context)
 
 
 async def extract_kg_relations(
     chat,
     structure: KgDocumentStructure,
     chunks: list[KgExtractionChunk],
-    max_chunks: int = 72,
+    chunk_batch_size: int = 72,
+    document_version: int = 1,
     concurrency: int = DEFAULT_EXTRACTION_CONCURRENCY,
     chunk_timeout_seconds: float = DEFAULT_CHUNK_TIMEOUT_SECONDS,
 ) -> tuple[list[KgEntityNode], list[KgEvidenceRelation]]:
     structure_relations = build_structure_relations(structure, chunks)
-    selected_chunks = chunks[: max(1, max_chunks)]
-
     if chat is None:
-        extracted = [(chunk, _heuristic_extract(chunk)) for chunk in selected_chunks]
-    else:
-        semaphore = asyncio.Semaphore(max(1, concurrency))
+        raise RuntimeError("Qwen chat service is required for KG extraction")
 
-        async def extract_one(
-            index: int,
-            chunk: KgExtractionChunk,
-        ) -> tuple[int, KgExtractionChunk, dict[str, Any]]:
-            async with semaphore:
-                try:
-                    raw = await asyncio.wait_for(
-                        chat.complete(
-                            [
-                                {
-                                    "role": "system",
-                                    "content": KG_RELATION_EXTRACTION_SYSTEM_PROMPT.strip(),
-                                },
-                                {
-                                    "role": "user",
-                                    "content": build_kg_relation_prompt(structure.title, chunk),
-                                },
-                            ],
-                            temperature=0.05,
-                        ),
-                        timeout=max(0.01, chunk_timeout_seconds),
-                    )
-                    parsed = _extract_json(raw)
-                except Exception as exc:
-                    logger.warning(
-                        "KG LLM extraction failed for chunk %s; using heuristic fallback: %s",
-                        chunk.kg_chunk_id,
-                        exc,
-                    )
-                    parsed = _heuristic_extract(chunk)
-                return index, chunk, parsed
+    semaphore = asyncio.Semaphore(max(1, concurrency))
 
-        completed = await asyncio.gather(
-            *(extract_one(index, chunk) for index, chunk in enumerate(selected_chunks))
+    async def extract_one(
+        index: int,
+        chunk: KgExtractionChunk,
+    ) -> tuple[int, KgExtractionChunk, dict[str, Any]]:
+        async with semaphore:
+            try:
+                raw = await asyncio.wait_for(
+                    chat.complete(
+                        [
+                            {
+                                "role": "system",
+                                "content": KG_RELATION_EXTRACTION_SYSTEM_PROMPT.strip(),
+                            },
+                            {
+                                "role": "user",
+                                "content": build_kg_relation_prompt(structure.title, chunk),
+                            },
+                        ],
+                        temperature=0.05,
+                        response_format=KG_EXTRACTION_RESPONSE_FORMAT,
+                    ),
+                    timeout=max(0.01, chunk_timeout_seconds),
+                )
+                return index, chunk, _extract_json(raw)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"KG extraction failed for chunk {chunk.kg_chunk_id}: {exc}"
+                ) from exc
+
+    completed: list[tuple[int, KgExtractionChunk, dict[str, Any]]] = []
+    batch_size = max(1, chunk_batch_size)
+    for start in range(0, len(chunks), batch_size):
+        batch = chunks[start : start + batch_size]
+        completed.extend(
+            await asyncio.gather(
+                *(extract_one(start + offset, chunk) for offset, chunk in enumerate(batch))
+            )
         )
-        completed.sort(key=lambda item: item[0])
-        extracted = [(chunk, parsed) for _, chunk, parsed in completed]
+    completed.sort(key=lambda item: item[0])
+    extracted = [(chunk, parsed) for _, chunk, parsed in completed]
 
-    entities, business_relations = _normalize_extraction(extracted)
+    entities, business_relations = _normalize_extraction(
+        extracted,
+        structure.document_id,
+        document_version,
+    )
     entity_relations = _entity_context_relations(entities, chunks)
     return entities, [*structure_relations, *entity_relations, *business_relations]
 
@@ -209,9 +263,11 @@ def build_structure_relations(
 
 def _normalize_extraction(
     extracted: list[tuple[KgExtractionChunk, dict[str, Any]]],
+    document_id: str,
+    document_version: int,
 ) -> tuple[list[KgEntityNode], list[KgEvidenceRelation]]:
     entities_by_key: dict[str, KgEntityNode] = {}
-    name_index: dict[tuple[str, str], str] = {}
+    identity_index: dict[tuple[str, str], str] = {}
     relations: list[KgEvidenceRelation] = []
 
     def ensure_entity(
@@ -221,10 +277,31 @@ def _normalize_extraction(
     ) -> KgEntityNode:
         canonical = _clean_name(name)
         scope = " > ".join(chunk.heading_path)
-        key = f"{_normalize_key(canonical)}|{_normalize_key(scope)}"
+        canonical_key = _normalize_key(canonical)
+        scope_key = _normalize_key(scope)
+        key = identity_index.get((canonical_key, scope_key), "")
+        clean_aliases = [
+            clean
+            for clean in (_clean_name(alias) for alias in aliases or [])
+            if clean and clean != canonical
+        ]
+        if not key:
+            alias_matches = {
+                identity_index[(_normalize_key(alias), scope_key)]
+                for alias in clean_aliases
+                if (_normalize_key(alias), scope_key) in identity_index
+            }
+            if len(alias_matches) == 1:
+                key = next(iter(alias_matches))
+        if not key:
+            key = f"{canonical_key}|{scope_key}"
         if key not in entities_by_key:
-            scope_hash = hashlib.sha1(scope.encode()).hexdigest()[:8]
-            entity_id = f"entity:{_normalize_key(canonical) or 'unknown'}:{scope_hash}"
+            identity = (
+                f"{document_id}|{document_version}|"
+                f"{canonical_key or 'unknown'}|{scope_key}"
+            )
+            identity_hash = hashlib.sha1(identity.encode()).hexdigest()[:20]
+            entity_id = f"entity:{document_id}:v{document_version}:{identity_hash}"
             entities_by_key[key] = KgEntityNode(
                 entity_id=entity_id,
                 name=canonical,
@@ -234,18 +311,14 @@ def _normalize_extraction(
                 disambiguation_key=key,
                 source_kg_chunk_ids=[],
             )
-            name_index[(_normalize_key(canonical), scope)] = entity_id
         entity = entities_by_key[key]
+        identity_index.setdefault((canonical_key, scope_key), key)
         if chunk.kg_chunk_id not in entity.source_kg_chunk_ids:
             entity.source_kg_chunk_ids.append(chunk.kg_chunk_id)
-        for alias in aliases or []:
-            clean_alias = _clean_name(alias)
-            if (
-                clean_alias
-                and clean_alias != entity.canonical_name
-                and clean_alias not in entity.aliases
-            ):
+        for clean_alias in clean_aliases:
+            if clean_alias != entity.canonical_name and clean_alias not in entity.aliases:
                 entity.aliases.append(clean_alias)
+            identity_index.setdefault((_normalize_key(clean_alias), scope_key), key)
         return entity
 
     for chunk, parsed in extracted:
@@ -366,50 +439,6 @@ def _entity_context_relations(
                     )
                 )
     return relations
-
-
-def _heuristic_extract(chunk: KgExtractionChunk) -> dict[str, Any]:
-    """Small deterministic fallback used by tests and offline examples."""
-    candidates = []
-    for term in ["风险识别", "风险分析", "风险应对", "风险监控", "风险管理"]:
-        if term in chunk.text or term in " ".join(chunk.heading_path):
-            candidates.append(term)
-    entities = [
-        {
-            "name": name,
-            "aliases": [],
-            "evidence_text": name if name in chunk.text else "标题路径",
-            "context_dependency": "explicit" if name in chunk.text else "heading_context",
-            "confidence": 0.86,
-        }
-        for name in candidates
-    ]
-    relations = []
-    if "风险识别" in candidates and "风险应对" in candidates:
-        relations.append(
-            {
-                "subject": "风险识别",
-                "predicate": "支持",
-                "object": "风险应对",
-                "evidence_text": _truncate(chunk.text, 160),
-                "context_dependency": "explicit",
-                "confidence": 0.8,
-            }
-        )
-    heading = chunk.heading_path[-1] if chunk.heading_path else ""
-    for name in candidates:
-        if heading and heading != name:
-            relations.append(
-                {
-                    "subject": name,
-                    "predicate": "属于主题",
-                    "object": heading,
-                    "evidence_text": heading,
-                    "context_dependency": "heading_context",
-                    "confidence": 0.82,
-                }
-            )
-    return {"entities": entities, "relations": relations}
 
 
 def _child_predicate(parent_type: str, child_type: str) -> str:

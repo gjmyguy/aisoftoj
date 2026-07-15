@@ -6,6 +6,7 @@ import { init, use } from 'echarts/core';
 import { CanvasRenderer } from 'echarts/renderers';
 import {
   Bot,
+  BookOpen,
   Brain,
   Filter,
   GitBranch,
@@ -30,12 +31,14 @@ import {
   KnowledgeGraphNode,
   KnowledgeGraphScope,
   KnowledgePointRecommendation,
+  KnowledgeBase,
   fetchKnowledgeGraph,
   fetchKnowledgePointRecommendations,
   fetchWrongQuestions,
+  listKnowledgeBases,
 } from '../lib/api';
 
-const RECOMMENDATION_TIMEOUT_MS = 15000;
+const RECOMMENDATION_TIMEOUT_MS = 120000;
 const GRAPH_TIMEOUT_MS = 120000;
 
 use([GraphChart, LegendComponent, TooltipComponent, CanvasRenderer]);
@@ -516,7 +519,12 @@ function RecommendationCards({
               <h3>{item.name}</h3>
               <p>{item.subject}</p>
             </div>
-            <Badge className="bg-blue-100 text-blue-700">{levelLabel(item.level)}</Badge>
+            <div className="flex flex-col items-end gap-1">
+              <Badge className="bg-blue-100 text-blue-700">{levelLabel(item.level)}</Badge>
+              <Badge variant="outline" className="text-[11px] text-slate-500">
+                {item.sourceType === 'document_knowledge_graph' ? '原文图谱' : '分类回退'}
+              </Badge>
+            </div>
           </div>
           <div className="wrong-score-row">
             <span>薄弱分 {item.score}</span>
@@ -525,6 +533,19 @@ function RecommendationCards({
           </div>
           <p className="wrong-card-reason">{item.reason}</p>
           <p className="wrong-card-suggestion">{item.suggestion}</p>
+          {item.sources?.slice(0, 2).map((source) => (
+            <div
+              key={`${source.documentId}-${source.sourcePageRange}`}
+              className="mt-2 flex gap-2 text-xs text-slate-500"
+            >
+              <BookOpen className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>
+                {source.documentName}
+                {source.sourcePageRange ? ` · 第 ${source.sourcePageRange} 页` : ''}
+                {source.headingPath?.length ? ` · ${source.headingPath.join(' / ')}` : ''}
+              </span>
+            </div>
+          ))}
           <div className="wrong-card-actions">
             <Button
               variant="outline"
@@ -566,56 +587,89 @@ export function WrongQuestions({ onViewQuestion }: WrongQuestionsProps) {
   const [selection, setSelection] = useState<GraphSelection>(null);
   const [graphQuery, setGraphQuery] = useState('');
   const [graphTypeFilter, setGraphTypeFilter] = useState('all');
+  const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([]);
+  const [selectedKnowledgeBaseId, setSelectedKnowledgeBaseId] = useState<number | null>(null);
+  const [knowledgeBasesLoaded, setKnowledgeBasesLoaded] = useState(false);
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const startRecord = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const endRecord = Math.min(page * pageSize, total);
 
   const loadIntel = useCallback(() => {
+    if (!knowledgeBasesLoaded) {
+      return () => undefined;
+    }
     let cancelled = false;
     const recommendationController = new AbortController();
     const graphController = new AbortController();
     setIsIntelLoading(true);
     setIntelError(null);
 
-    withTimeout(
-      fetchKnowledgePointRecommendations(recommendationController.signal),
-      RECOMMENDATION_TIMEOUT_MS,
-      '知识点推荐',
-      () => recommendationController.abort()
-    )
-      .then((items) => {
+    void (async () => {
+      try {
+        const items = await withTimeout(
+          fetchKnowledgePointRecommendations(
+            selectedKnowledgeBaseId ?? undefined,
+            recommendationController.signal
+          ),
+          RECOMMENDATION_TIMEOUT_MS,
+          '知识点推荐',
+          () => recommendationController.abort()
+        );
         if (!cancelled) setRecommendations(items);
-      })
-      .catch((err) => {
+      } catch (err) {
         if (!cancelled) {
           setRecommendations([]);
-          setIntelError(err.message || '知识点推荐加载失败');
+          setIntelError(err instanceof Error ? err.message : '知识点推荐加载失败');
         }
-      });
+      }
 
-    withTimeout(
-      fetchKnowledgeGraph(graphScope, graphController.signal),
-      GRAPH_TIMEOUT_MS,
-      '知识图谱',
-      () => graphController.abort()
-    )
-      .then((loadedGraph) => {
+      try {
+        const loadedGraph = await withTimeout(
+          fetchKnowledgeGraph(
+            graphScope,
+            selectedKnowledgeBaseId ?? undefined,
+            graphController.signal
+          ),
+          GRAPH_TIMEOUT_MS,
+          '知识图谱',
+          () => graphController.abort()
+        );
         if (!cancelled) setGraph(loadedGraph);
-      })
-      .catch((err) => {
+      } catch (err) {
         if (!cancelled) {
           setGraph(null);
-          setIntelError((current) => [current, err.message || '知识图谱加载失败'].filter(Boolean).join('；'));
+          const message = err instanceof Error ? err.message : '知识图谱加载失败';
+          setIntelError((current) => [current, message].filter(Boolean).join('；'));
         }
-      })
-      .finally(() => !cancelled && setIsIntelLoading(false));
+      } finally {
+        if (!cancelled) setIsIntelLoading(false);
+      }
+    })();
 
     return () => {
       cancelled = true;
       recommendationController.abort();
       graphController.abort();
     };
-  }, [graphScope]);
+  }, [graphScope, knowledgeBasesLoaded, selectedKnowledgeBaseId]);
+
+  useEffect(() => {
+    let isMounted = true;
+    listKnowledgeBases()
+      .then((items) => {
+        if (!isMounted) return;
+        setKnowledgeBases(items);
+        const selected = items.find(item => item.isDefault) || items[0];
+        setSelectedKnowledgeBaseId(selected?.id ?? null);
+      })
+      .catch((err) => {
+        if (isMounted) setIntelError(err.message || '知识库列表加载失败');
+      })
+      .finally(() => isMounted && setKnowledgeBasesLoaded(true));
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   useEffect(() => {
     let isMounted = true;
@@ -679,6 +733,28 @@ export function WrongQuestions({ onViewQuestion }: WrongQuestionsProps) {
               </div>
             )}
             <div className="wrong-graph-toolbar">
+              <Select
+                value={selectedKnowledgeBaseId == null ? 'none' : String(selectedKnowledgeBaseId)}
+                onValueChange={(value) => setSelectedKnowledgeBaseId(
+                  value === 'none' ? null : Number(value)
+                )}
+              >
+                <SelectTrigger className="wrong-filter-select" aria-label="推荐知识库">
+                  <BookOpen className="mr-2 h-4 w-4" />
+                  <SelectValue placeholder="选择知识库" />
+                </SelectTrigger>
+                <SelectContent>
+                  {knowledgeBases.length === 0 && (
+                    <SelectItem value="none">暂无知识库</SelectItem>
+                  )}
+                  {knowledgeBases.map((knowledgeBase) => (
+                    <SelectItem key={knowledgeBase.id} value={String(knowledgeBase.id)}>
+                      {knowledgeBase.name}
+                      {knowledgeBase.readyCount > 0 ? '' : '（暂无就绪文档）'}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
               <ToggleGroup
                 type="single"
                 value={graphScope}

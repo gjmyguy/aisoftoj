@@ -38,7 +38,7 @@ public class KnowledgeDocumentServiceImpl implements KnowledgeDocumentService {
     private static final Set<String> ACTIVE_STATUSES = new HashSet<>(Arrays.asList(
             "uploaded", "queued", "parsing", "normalizing", "chunking", "embedding", "indexing"
     ));
-    private static final int GRAPH_CHUNK_LIMIT = 72;
+    private static final int GRAPH_CHUNK_BATCH_SIZE = 72;
     private static final int KG_ALIGNMENT_WRONG_QUESTION_LIMIT = 60;
     private static final int KG_ALIGNMENT_LIMIT = 120;
 
@@ -209,12 +209,7 @@ public class KnowledgeDocumentServiceImpl implements KnowledgeDocumentService {
         if (!"ready".equals(version.getStatus())) {
             throw new IllegalArgumentException("文档可检索后才能抽取知识图谱");
         }
-        graphClient.markDocumentGraphStatus(
-                document.getDocumentId(),
-                version.getVersion(),
-                "running",
-                "");
-        CompletableFuture.runAsync(() -> runGraphExtraction(userId, document.getId(), version.getVersion()));
+        scheduleGraphExtraction(userId, document, version.getVersion(), true);
         return detail(userId, id);
     }
 
@@ -236,6 +231,10 @@ public class KnowledgeDocumentServiceImpl implements KnowledgeDocumentService {
         document.setKnowledgeBaseId(base.getVectorId());
         document.setUpdateTime(LocalDateTime.now());
         documentMapper.updateById(document);
+        graphClient.moveDocumentKnowledgeGraph(
+                userId.intValue(),
+                document.getDocumentId(),
+                base.getVectorId());
         return toDocumentDTO(document, base, currentVersion(document), null);
     }
 
@@ -377,12 +376,42 @@ public class KnowledgeDocumentServiceImpl implements KnowledgeDocumentService {
         }
     }
 
-    private void runGraphExtraction(Long userId, Long documentPk, Integer versionNumber) {
+    private boolean scheduleGraphExtraction(
+            Long userId,
+            KnowledgeDocument document,
+            Integer versionNumber,
+            boolean force) {
+        String runId = UUID.randomUUID().toString();
+        boolean started = graphClient.tryStartDocumentGraphExtraction(
+                document.getDocumentId(),
+                versionNumber,
+                runId,
+                force);
+        if (!started) {
+            return false;
+        }
+        CompletableFuture.runAsync(() -> runGraphExtraction(
+                userId,
+                document.getId(),
+                versionNumber,
+                runId));
+        return true;
+    }
+
+    private void runGraphExtraction(
+            Long userId,
+            Long documentPk,
+            Integer versionNumber,
+            String runId) {
         KnowledgeDocument document = documentMapper.selectById(documentPk);
         if (document == null) {
             return;
         }
         try {
+            if (!Objects.equals(document.getUserId(), userId)
+                    || !Objects.equals(document.getVersion(), versionNumber)) {
+                throw new IllegalStateException("Document version has been superseded");
+            }
             KnowledgeDocumentVersion version = versionMapper.selectOne(
                     new LambdaQueryWrapper<KnowledgeDocumentVersion>()
                             .eq(KnowledgeDocumentVersion::getDocumentId, document.getId())
@@ -404,19 +433,27 @@ public class KnowledgeDocumentServiceImpl implements KnowledgeDocumentService {
                     graph.put("wrong_question_alignment_error", message(alignmentException));
                 }
             }
+            KnowledgeDocument currentDocument = documentMapper.selectById(documentPk);
+            if (currentDocument == null
+                    || !Objects.equals(currentDocument.getUserId(), userId)
+                    || !Objects.equals(currentDocument.getVersion(), versionNumber)) {
+                throw new IllegalStateException("Document version has been superseded");
+            }
             graphClient.syncDocumentKnowledgeGraph(
                     userId.intValue(),
-                    document.getDocumentId(),
-                    document.getKnowledgeBaseId(),
-                    document.getFileName(),
+                    currentDocument.getDocumentId(),
+                    currentDocument.getKnowledgeBaseId(),
+                    currentDocument.getFileName(),
                     version.getVersion(),
+                    runId,
                     graph);
         } catch (Exception exception) {
             graphClient.markDocumentGraphStatus(
                     document.getDocumentId(),
                     versionNumber,
                     "failed",
-                    message(exception));
+                    message(exception),
+                    runId);
         }
     }
 
@@ -428,7 +465,7 @@ public class KnowledgeDocumentServiceImpl implements KnowledgeDocumentService {
         body.put("knowledge_base_id", document.getKnowledgeBaseId());
         body.put("document_id", document.getDocumentId());
         body.put("version", version.getVersion());
-        body.put("max_chunks", GRAPH_CHUNK_LIMIT);
+        body.put("chunk_batch_size", GRAPH_CHUNK_BATCH_SIZE);
         byte[] payload = objectMapper.writeValueAsBytes(body);
         HttpURLConnection connection = connection("/api/v1/knowledge-graph/documents/extract", "POST");
         connection.setReadTimeout(Math.max(60_000, graphExtractionTimeoutMillis));
@@ -549,6 +586,7 @@ public class KnowledgeDocumentServiceImpl implements KnowledgeDocumentService {
             Map<String, Object> payload) {
         String status = string(payload.get("status"));
         if (status == null) return;
+        String previousStatus = version.getStatus();
         version.setStatus(status);
         version.setProgress(progressFor(status));
         version.setQueuedAhead(integer(payload.get("queuedAhead")));
@@ -584,6 +622,13 @@ public class KnowledgeDocumentServiceImpl implements KnowledgeDocumentService {
             document.setJobId(version.getAiJobId());
             document.setUpdateTime(LocalDateTime.now());
             documentMapper.updateById(document);
+        }
+        if ("ready".equals(status) && !"ready".equals(previousStatus)) {
+            scheduleGraphExtraction(
+                    document.getUserId(),
+                    document,
+                    version.getVersion(),
+                    false);
         }
     }
 

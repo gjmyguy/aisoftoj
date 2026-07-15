@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, HttpUrl, model_validator
+from pydantic import AliasChoices, BaseModel, Field, HttpUrl, model_validator
 
 from aisoftoj_ai.rag.models import SearchResult
 
@@ -99,7 +99,13 @@ class DocumentGraphExtractionRequest(BaseModel):
     document_id: str = Field(min_length=1)
     version: int = Field(default=1, ge=1)
     document_title: str | None = None
-    max_chunks: int = Field(default=72, ge=1, le=200)
+    chunk_batch_size: int = Field(
+        default=72,
+        ge=1,
+        le=200,
+        validation_alias=AliasChoices("chunk_batch_size", "max_chunks"),
+        description="每批提交给抽取协程的 chunk 数；不会截断文档",
+    )
 
 
 class WrongQuestionAlignmentRequest(BaseModel):
